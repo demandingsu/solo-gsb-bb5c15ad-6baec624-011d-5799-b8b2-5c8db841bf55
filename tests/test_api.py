@@ -253,3 +253,105 @@ def test_locked_negative_coordinates_rejected():
         "locked_placements": [{"item": "A", "x": -1, "y": 0}],
     }
     assert client.post("/plans", json=payload).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# max_cuts_per_sheet
+# ---------------------------------------------------------------------------
+
+def _count_cuts(node):
+    if node["type"] != "cut":
+        return 0
+    return 1 + sum(_count_cuts(c) for c in node["children"])
+
+
+def test_max_cuts_happy_path_and_cut_counts():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 50, "height": 50, "quantity": 4}],
+        "max_cuts_per_sheet": 2,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    assert body["summary"]["sheet_count"] == 2
+    for sheet in body["sheets"]:
+        assert sheet["cut_count"] == _count_cuts(sheet["cut_tree"]) <= 2
+
+
+def test_cut_count_returned_without_limit():
+    response = client.post("/plans", json=VALID_PAYLOAD)
+    assert response.status_code == 200
+    for sheet in response.json()["sheets"]:
+        assert sheet["cut_count"] == _count_cuts(sheet["cut_tree"])
+        assert sheet["cut_count"] >= 0
+
+
+def test_max_cuts_unplaceable_piece_returns_422():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 50, "height": 50, "quantity": 1}],
+        "max_cuts_per_sheet": 1,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "A" in detail and "max_cuts_per_sheet" in detail
+
+
+def test_max_cuts_zero_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 50, "height": 50, "quantity": 1}],
+        "max_cuts_per_sheet": 0,
+    }
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_max_cuts_negative_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 50, "height": 50, "quantity": 1}],
+        "max_cuts_per_sheet": -3,
+    }
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_max_cuts_must_be_integer():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 50, "height": 50, "quantity": 1}],
+        "max_cuts_per_sheet": 2.5,
+    }
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_locked_layout_over_cut_limit_returns_422():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "locked_placements": [{"item": "A", "x": 0, "y": 0}],
+        "max_cuts_per_sheet": 1,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "locked" in detail and "max_cuts_per_sheet" in detail
+
+
+def test_exact_fit_piece_allows_tight_limit():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 5,
+        "items": [{"id": "A", "width": 100, "height": 100, "quantity": 2}],
+        "max_cuts_per_sheet": 1,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    # Each piece consumes a whole sheet with zero cuts.
+    assert body["summary"]["sheet_count"] == 2
+    assert all(s["cut_count"] == 0 for s in body["sheets"])

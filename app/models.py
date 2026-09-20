@@ -55,6 +55,13 @@ class PlanRequest(BaseModel):
             "递归分解为铡刀切割树。"
         ),
     )
+    max_cuts_per_sheet: Optional[int] = Field(
+        default=None, ge=1,
+        description=(
+            "每张原纸允许的刀数上限，刀数按 cut_tree 中的 cut 节点计数"
+            "（第一张纸的锁定布局同样计入）；缺省表示不限制。"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_request(self) -> "PlanRequest":
@@ -134,6 +141,8 @@ class SheetPlan(BaseModel):
                                description="成品面积 / 原纸面积")
     placements: list[Placement]
     cut_tree: TreeNode = Field(description="与 placements 坐标一致的二叉切割树")
+    cut_count: int = Field(
+        description="该原纸的刀数，即 cut_tree 中 cut 节点的实际数量")
 
 
 class Summary(BaseModel):

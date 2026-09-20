@@ -51,6 +51,18 @@ class UnfitItemError(ValueError):
         )
 
 
+class CutLimitError(ValueError):
+    """Raised when an item cannot be placed within the per-sheet cut limit."""
+
+    def __init__(self, item_id: str, needed: int, limit: int) -> None:
+        self.item_id = item_id
+        super().__init__(
+            f"item '{item_id}' cannot be placed within the max_cuts_per_sheet "
+            f"limit of {limit}: even a blank stock sheet requires {needed} "
+            "guillotine cuts (remaining offcuts narrower than the kerf aside)"
+        )
+
+
 class LockedLayoutError(ValueError):
     """Raised when pinned placements do not form a kerf-valid guillotine layout."""
 
@@ -111,6 +123,7 @@ class Sheet:
     free: list[Node] = field(default_factory=list)
     placements: list[dict] = field(default_factory=list)
     used_area: float = 0.0
+    cut_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +168,20 @@ def _corner_fill_ok(pw: float, ph: float, width: float, height: float,
     return ok_r and ok_b
 
 
+def _added_cuts(pw: float, ph: float, width: float, height: float,
+                kerf: float) -> int:
+    """Cuts _fill introduces when corner-filling a piece in this rectangle.
+
+    A slack that vanishes (piece reaches the far edge) needs no cut; each
+    axis with a usable offcut beyond the kerf needs one, except the
+    both-axes case where the corner piece needs two nested cuts.  Trim
+    slivers below the kerf consume no cut node (edge trim).
+    """
+    has_right = width - pw - kerf > EPS
+    has_bottom = height - ph - kerf > EPS
+    return int(has_right) + int(has_bottom)
+
+
 # ---------------------------------------------------------------------------
 # tree building
 # ---------------------------------------------------------------------------
@@ -187,13 +214,15 @@ def _item_node(x: float, y: float, pw: float, ph: float,
 
 
 def _fill(node: Node, piece: Piece, pw: float, ph: float, kerf: float,
-          rotated: bool | None = None, locked_ref: int | None = None) -> list[Node]:
+          rotated: bool | None = None, locked_ref: int | None = None
+          ) -> tuple[list[Node], int]:
     """Place a piece (pw x ph) at the top-left corner of free leaf ``node``.
 
-    Mutates ``node`` into an item leaf or a cut subtree and returns the new
-    free rectangles created by the split.  Every split consumes ``kerf``
-    material; remainders not wider than the kerf are discarded as trim loss.
-    ``rotated`` defaults to being derived from the piece's base dimensions.
+    Mutates ``node`` into an item leaf or a cut subtree and returns
+    (new free rectangles created by the split, number of cut nodes added).
+    Every split consumes ``kerf`` material; remainders not wider than the
+    kerf are discarded as trim loss.  ``rotated`` defaults to being derived
+    from the piece's base dimensions.
     """
     x, y, w, h = node.x, node.y, node.width, node.height
     if rotated is None:
@@ -208,7 +237,7 @@ def _fill(node: Node, piece: Piece, pw: float, ph: float, kerf: float,
     if not has_right and not has_bottom:
         # The piece consumes the whole rectangle (slivers <= kerf are trim).
         _become_item(node, item)
-        return []
+        return [], 0
 
     if has_right and has_bottom:
         # Both offcuts are usable.  Two guillotine split orders are possible;
@@ -221,23 +250,23 @@ def _fill(node: Node, piece: Piece, pw: float, ph: float, kerf: float,
             strip = Node("cut", x, y, pw, h, direction="horizontal",
                          children=[item, bottom])
             _become_cut(node, "vertical", [strip, right])
-            return [right, bottom]
+            return [right, bottom], 2
         # Horizontal cut first, mirrored.
         right = Node("free", x + pw + kerf, y, right_w, ph)
         bottom = Node("free", x, y + ph + kerf, w, bottom_h)
         strip = Node("cut", x, y, w, ph, direction="vertical",
                      children=[item, right])
         _become_cut(node, "horizontal", [strip, bottom])
-        return [bottom, right]
+        return [bottom, right], 2
 
     if has_right:
         right = Node("free", x + pw + kerf, y, right_w, h)
         _become_cut(node, "vertical", [item, right])
-        return [right]
+        return [right], 1
 
     bottom = Node("free", x, y + ph + kerf, w, bottom_h)
     _become_cut(node, "horizontal", [item, bottom])
-    return [bottom]
+    return [bottom], 1
 
 
 def _prune(free: list[Node], limit: int = 200) -> None:
@@ -265,11 +294,13 @@ def _prune(free: list[Node], limit: int = 200) -> None:
     free[:] = kept
 
 
-def _best_fit(sheets: list[Sheet], piece: Piece):
+def _best_fit(sheets: list[Sheet], piece: Piece, max_cuts: int | None = None):
     """Find the best placement for a piece across all open sheets.
 
-    Returns (sheet_index, free_rect_index, pw, ph) or None.  Scoring is
-    best-short-side-fit with best-area-fit as tie-breaker.
+    Returns (sheet_index, free_rect_index, pw, ph, added_cuts) or None.
+    Scoring is best-short-side-fit, then best-area-fit; candidates with the
+    same fit are ranked by the number of new guillotine cuts they would add.
+    Rectangles whose resulting tree would exceed ``max_cuts`` are rejected.
     """
     best = None
     for si, sheet in enumerate(sheets):
@@ -282,22 +313,30 @@ def _best_fit(sheets: list[Sheet], piece: Piece):
                     # Fitting here would leave an unrepresentable trim
                     # sliver between the piece and the kerf; skip it.
                     continue
+                added = _added_cuts(pw, ph, rect.width, rect.height,
+                                    sheet.kerf)
+                if max_cuts is not None and sheet.cut_count + added > max_cuts:
+                    # This offcut would push the sheet past its cut budget.
+                    continue
                 short_side = min(rect.width - pw, rect.height - ph)
                 area_left = rect.width * rect.height - pw * ph
-                score = (short_side, area_left)
+                score = (short_side, area_left, added)
                 if best is None or score < best[0]:
-                    best = (score, si, fi, pw, ph)
+                    best = (score, si, fi, pw, ph, added)
     if best is None:
         return None
-    _, si, fi, pw, ph = best
-    return si, fi, pw, ph
+    _, si, fi, pw, ph, added = best
+    return si, fi, pw, ph, added
 
 
-def _place(sheet: Sheet, free_idx: int, piece: Piece, pw: float, ph: float) -> None:
+def _place(sheet: Sheet, free_idx: int, piece: Piece, pw: float, ph: float,
+           added: int) -> None:
     rect = sheet.free.pop(free_idx)
-    new_rects = _fill(rect, piece, pw, ph, sheet.kerf)
+    new_rects, cuts = _fill(rect, piece, pw, ph, sheet.kerf)
+    assert cuts == added
     sheet.free.extend(new_rects)
     _prune(sheet.free)
+    sheet.cut_count += cuts
     sheet.used_area += pw * ph
     sheet.placements.append({
         "item": piece.item_id,
@@ -324,13 +363,14 @@ def _locked_labels(group: list[LockedPiece]) -> list[str]:
     return labels
 
 
-def _isolate_locked(node: Node, lp: LockedPiece, kerf: float) -> list[Node]:
+def _isolate_locked(node: Node, lp: LockedPiece, kerf: float
+                    ) -> tuple[list[Node], int]:
     """Fill a free region containing exactly one pinned piece.
 
     Peels free strips off the top/left edges (each cut consumes ``kerf``)
     until the piece is flush with the region's origin, then splits the
-    right/bottom offcuts with the usual corner fill.  Returns the new free
-    rectangles.
+    right/bottom offcuts with the usual corner fill.  Returns
+    (new free rectangles, number of cut nodes added).
 
     A gap of exactly 0 needs no cut; a gap larger than ``kerf`` leaves a
     free strip (gap minus kerf).  A gap in between is impossible: the blade
@@ -338,6 +378,7 @@ def _isolate_locked(node: Node, lp: LockedPiece, kerf: float) -> list[Node]:
     origin-side leaf, so the pinned layout is not guillotine-separable.
     """
     free_rects: list[Node] = []
+    cuts_added = 0
     top_gap = lp.y - node.y
     left_gap = lp.x - node.x
     if not (left_gap <= EPS or left_gap > kerf + EPS) \
@@ -365,6 +406,7 @@ def _isolate_locked(node: Node, lp: LockedPiece, kerf: float) -> list[Node]:
         strip = Node("free", node.x, node.y, node.width, strip_w)
         _become_cut(node, "horizontal", [strip, inner])
         free_rects.append(strip)
+        cuts_added += 1
         node = inner
         top_gap = 0.0
 
@@ -375,6 +417,7 @@ def _isolate_locked(node: Node, lp: LockedPiece, kerf: float) -> list[Node]:
         strip = Node("free", node.x, node.y, strip_w, node.height)
         _become_cut(node, "vertical", [strip, inner])
         free_rects.append(strip)
+        cuts_added += 1
         node = inner
         left_gap = 0.0
 
@@ -385,14 +428,16 @@ def _isolate_locked(node: Node, lp: LockedPiece, kerf: float) -> list[Node]:
         strip = Node("free", node.x, node.y, node.width, strip_w)
         _become_cut(node, "horizontal", [strip, inner])
         free_rects.append(strip)
+        cuts_added += 1
         node = inner
         top_gap = 0.0
 
-    free_rects.extend(_fill(
+    more_rects, more_cuts = _fill(
         node, lp.piece, lp.width, lp.height, kerf,
         rotated=lp.rotated, locked_ref=lp.ref,
-    ))
-    return free_rects
+    )
+    free_rects.extend(more_rects)
+    return free_rects, cuts_added + more_cuts
 
 
 def _valid_region(node: Node, group: list[LockedPiece]) -> bool:
@@ -407,12 +452,13 @@ def _valid_region(node: Node, group: list[LockedPiece]) -> bool:
 
 
 def _decompose_locked(node: Node, group: list[LockedPiece],
-                      kerf: float, budget: list[int]) -> list[Node]:
+                      kerf: float, budget: list[int]
+                      ) -> tuple[list[Node], int]:
     """Recursively turn free ``node`` into a cut tree over ``group``.
 
-    Returns the usable free leaves created by the decomposition.  Raises
-    LockedLayoutError if the pinned layout cannot be produced by full-span
-    guillotine cuts separated by ``kerf``-wide strips.
+    Returns (usable free leaves created by the decomposition, number of cut
+    nodes added).  Raises LockedLayoutError if the pinned layout cannot be
+    produced by full-span guillotine cuts separated by ``kerf``-wide strips.
     """
     budget[0] -= 1
     if budget[0] <= 0:
@@ -421,7 +467,7 @@ def _decompose_locked(node: Node, group: list[LockedPiece],
             "guillotine cut tree within the search budget"
         )
     if not group:
-        return [node]
+        return [node], 0
     if len(group) == 1:
         return _isolate_locked(node, group[0], kerf)
 
@@ -528,13 +574,15 @@ def _decompose_locked(node: Node, group: list[LockedPiece],
                 or not _valid_region(second, second_group):
             continue
         try:
-            free_first = _decompose_locked(first, first_group, kerf, budget)
-            free_second = _decompose_locked(second, second_group, kerf, budget)
+            free_first, cuts_first = _decompose_locked(
+                first, first_group, kerf, budget)
+            free_second, cuts_second = _decompose_locked(
+                second, second_group, kerf, budget)
         except LockedLayoutError as exc:
             _consider(exc)
             continue
         _become_cut(node, direction, [first, second])
-        return free_first + free_second
+        return free_first + free_second, 1 + cuts_first + cuts_second
 
     stuck_group = smallest_stuck if smallest_stuck is not None else group
     labels = ", ".join(_locked_labels(stuck_group))
@@ -564,6 +612,13 @@ def _finalize(node: Node) -> None:
     if node.kind == "cut":
         for child in node.children:
             _finalize(child)
+
+
+def _count_cuts(node: Node) -> int:
+    """Number of cut nodes in a finished tree."""
+    if node.kind != "cut":
+        return 0
+    return 1 + sum(_count_cuts(child) for child in node.children)
 
 
 def _node_dict(node: Node) -> dict:
@@ -596,15 +651,19 @@ def _node_dict(node: Node) -> dict:
 
 def build_plan(stock_width: float, stock_height: float, kerf: float,
                items: list[tuple[str, float, float, int]],
-               locked: list[tuple[str, float, float, bool, int]] | None = None
+               locked: list[tuple[str, float, float, bool, int]] | None = None,
+               max_cuts: int | None = None
                ) -> dict:
     """Pack ``items`` (id, width, height, quantity) onto stock sheets.
 
     ``locked`` optionally pins pieces on the first sheet; each tuple is
     (item_id, x, y, rotated, request_index).  Locked pieces count towards
-    their item's quantity.  Returns a dict matching the PlanResponse schema.
-    Raises UnfitItemError if any item cannot fit on a fresh sheet, or
-    LockedLayoutError if the pinned layout is invalid.
+    their item's quantity.  ``max_cuts`` optionally caps the number of cut
+    nodes allowed on any single sheet (the locked layout on the first sheet
+    included).  Returns a dict matching the PlanResponse schema.
+    Raises UnfitItemError if any item cannot fit on a fresh sheet,
+    CutLimitError if it cannot fit on a blank sheet within the cut budget,
+    or LockedLayoutError if the pinned layout is invalid.
     """
     catalog: dict[str, Piece] = {}
     for item_id, width, height, quantity in items:
@@ -662,8 +721,15 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
         sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
                       root=root)
         sheets.append(sheet)
-        free_rects = _decompose_locked(
+        free_rects, locked_cuts = _decompose_locked(
             root, locked_pieces, kerf, [LOCKED_SEARCH_BUDGET])
+        if max_cuts is not None and locked_cuts > max_cuts:
+            raise LockedLayoutError(
+                f"locked layout on the first sheet requires {locked_cuts} "
+                f"guillotine cuts but max_cuts_per_sheet is {max_cuts}: the "
+                "locked placements cannot be retained within the cut budget"
+            )
+        sheet.cut_count = locked_cuts
         sheet.free.extend(free_rects)
         _prune(sheet.free)
         for lp in sorted(locked_pieces, key=lambda p: (p.y, p.x)):
@@ -683,27 +749,37 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
                    reverse=True)
 
     for piece in remaining:
-        found = _best_fit(sheets, piece)
-        if found is None:
-            root = Node(kind="free", x=0.0, y=0.0,
-                        width=stock_width, height=stock_height)
-            sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
-                          root=root, free=[root])
-            sheets.append(sheet)
-            # A fresh sheet always fits (checked above); prefer unrotated.
-            pw, ph = piece.width, piece.height
-            if not _fits(pw, ph, stock_width, stock_height):
-                pw, ph = ph, pw
-            _place(sheet, 0, piece, pw, ph)
-        else:
-            si, fi, pw, ph = found
-            _place(sheets[si], fi, piece, pw, ph)
+        found = _best_fit(sheets, piece, max_cuts)
+        if found is not None:
+            si, fi, pw, ph, added = found
+            _place(sheets[si], fi, piece, pw, ph, added)
+            continue
+
+        # No usable offcut within the budget: open a new sheet.  Geometric
+        # fit was checked up front; among the fitting orientations prefer
+        # the one introducing the fewest cuts, then unrotated (the
+        # generator yields unrotated first and the sort is stable).
+        root = Node(kind="free", x=0.0, y=0.0,
+                    width=stock_width, height=stock_height)
+        sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
+                      root=root, free=[root])
+        options = [(pw, ph) for pw, ph in _orientations(piece)
+                   if _fits(pw, ph, stock_width, stock_height)]
+        options.sort(key=lambda op: _added_cuts(
+            op[0], op[1], stock_width, stock_height, kerf))
+        pw, ph = options[0]
+        needed = _added_cuts(pw, ph, stock_width, stock_height, kerf)
+        if max_cuts is not None and needed > max_cuts:
+            raise CutLimitError(piece.item_id, needed, max_cuts)
+        sheets.append(sheet)
+        _place(sheet, 0, piece, pw, ph, needed)
 
     sheet_area = stock_width * stock_height
     result_sheets = []
     total_used = 0.0
     for index, sheet in enumerate(sheets):
         _finalize(sheet.root)
+        cut_count = _count_cuts(sheet.root)
         total_used += sheet.used_area
         result_sheets.append({
             "index": index,
@@ -712,6 +788,7 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
             "utilization": round(sheet.used_area / sheet_area, 6),
             "placements": sheet.placements,
             "cut_tree": _node_dict(sheet.root),
+            "cut_count": cut_count,
         })
 
     return {

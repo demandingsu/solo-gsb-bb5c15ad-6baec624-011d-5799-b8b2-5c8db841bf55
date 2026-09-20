@@ -1,11 +1,14 @@
 import pytest
 
-from app.packer import LockedLayoutError, UnfitItemError, build_plan
-from tests.check_plan import check_plan, iter_leaves
+from app.packer import (
+    CutLimitError, LockedLayoutError, UnfitItemError, build_plan,
+)
+from tests.check_plan import check_plan, count_cuts, iter_leaves
 
 
-def plan(stock_w, stock_h, kerf, items):
-    return build_plan(stock_w, stock_h, kerf, items)
+def plan(stock_w, stock_h, kerf, items, max_cuts=None, locked=None):
+    return build_plan(stock_w, stock_h, kerf, items,
+                      locked=locked, max_cuts=max_cuts)
 
 
 class TestBasicPacking:
@@ -125,13 +128,99 @@ class TestTreeConsistency:
 
 
 # ---------------------------------------------------------------------------
+# per-sheet cut limit
+# ---------------------------------------------------------------------------
+
+class TestCutLimit:
+    def test_cut_count_matches_tree_without_limit(self):
+        result = plan(
+            900, 600, 3,
+            [("flyer", 210, 148, 8), ("card", 90, 55, 20), ("tag", 120, 80, 5)],
+        )
+        check_plan(result)
+        for sheet in result["sheets"]:
+            assert sheet["cut_count"] == count_cuts(sheet["cut_tree"])
+
+    def test_exact_fit_piece_needs_zero_cuts(self):
+        result = plan(100, 100, 5, [("A", 100, 100, 1)], max_cuts=1)
+        assert result["sheets"][0]["cut_count"] == 0
+
+    def test_cap_splits_pieces_across_more_sheets(self):
+        # Four 50x50 on 100x100 with kerf 0: unlimited -> 1 sheet / 3 cuts.
+        unlimited = plan(100, 100, 0, [("A", 50, 50, 4)])
+        assert unlimited["summary"]["sheet_count"] == 1
+        assert unlimited["sheets"][0]["cut_count"] == 3
+        # With cap 2 the third and fourth pieces need their own sheets.
+        capped = plan(100, 100, 0, [("A", 50, 50, 4)], max_cuts=2)
+        check_plan(capped)
+        assert capped["summary"]["sheet_count"] == 2
+        assert all(s["cut_count"] <= 2 for s in capped["sheets"])
+        assert [s["cut_count"] for s in capped["sheets"]] == [2, 2]
+
+    def test_cap_allows_single_cut_strips(self):
+        # 50x100 pieces: one vertical cut separates the two, so cap 1 is fine.
+        result = plan(100, 100, 0, [("A", 50, 100, 2)], max_cuts=1)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 1
+        assert result["sheets"][0]["cut_count"] == 1
+
+    def test_cap_one_rejects_corner_piece_even_on_blank_sheet(self):
+        # A 50x50 corner piece on a blank 100x100 sheet needs two cuts.
+        with pytest.raises(CutLimitError) as exc:
+            plan(100, 100, 0, [("A", 50, 50, 1)], max_cuts=1)
+        message = str(exc.value)
+        assert "A" in message and "1" in message and "2" in message
+
+    def test_unavailable_offcuts_force_new_sheet(self):
+        # After one 50x50 corner piece (2 cuts) the free 50x50 corner would
+        # add 0 cuts but later pieces would; with cap 2 only one more piece
+        # fits per sheet, so two sheets are needed for three pieces.
+        result = plan(100, 100, 0, [("A", 50, 50, 3)], max_cuts=2)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+        assert sum(len(s["placements"]) for s in result["sheets"]) == 3
+
+    def test_kerf_accounted_in_cut_budget(self):
+        # 45+5+45 == 95: two 45x100 strips share one cut; a third needs a
+        # new sheet.  Cap 1 packs two per sheet.
+        result = plan(100, 100, 5, [("A", 45, 100, 3)], max_cuts=1)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+        assert all(s["cut_count"] <= 1 for s in result["sheets"])
+
+    def test_no_limit_stays_backward_compatible(self):
+        result = plan(100, 100, 2, [("A", 30, 30, 20)])
+        check_plan(result)
+        for sheet in result["sheets"]:
+            assert isinstance(sheet["cut_count"], int)
+            assert sheet["cut_count"] >= 1
+
+    def test_piece_too_big_still_raises_unfit(self):
+        with pytest.raises(UnfitItemError):
+            plan(100, 100, 0, [("A", 120, 120, 1)], max_cuts=5)
+
+    def test_tight_offcut_over_budget_starts_new_sheet(self):
+        # Largest-first the 25x100 strip opens a sheet (1 cut); the 50x50
+        # pieces cannot join it (they would need 2 more cuts, cap is 2), so
+        # they share a second sheet laid out as a 2x2 grid.
+        result = plan(
+            100, 100, 0,
+            [("A", 50, 50, 2), ("B", 25, 100, 1)], max_cuts=2,
+        )
+        check_plan(result)
+        assert all(s["cut_count"] <= 2 for s in result["sheets"])
+        assert result["summary"]["sheet_count"] == 2
+
+
+# ---------------------------------------------------------------------------
 # locked placements
 # ---------------------------------------------------------------------------
 
-def _locked(items, pinned, stock_w=100, stock_h=100, kerf=0):
+def _locked(items, pinned, stock_w=100, stock_h=100, kerf=0, max_cuts=None):
     refs = [(iid, x, y, rot, i + 1)
             for i, (iid, x, y, rot) in enumerate(pinned)]
-    return build_plan(stock_w, stock_h, kerf, items, locked=refs)
+    return build_plan(stock_w, stock_h, kerf, items,
+                      locked=refs, max_cuts=max_cuts)
 
 
 class TestLockedPlacements:
@@ -291,3 +380,35 @@ class TestLockedPlacements:
                          stock_w=n * 11, stock_h=n * 11, kerf=1)
         check_plan(result)
         assert result["summary"]["piece_count"] == n * n
+
+    def test_locked_tree_counts_towards_limit(self):
+        # One locked corner piece on 100x100, kerf 0: its decomposition needs
+        # two cuts (right strip + bottom strip).
+        result = _locked([("A", 40, 40, 1)], [("A", 0, 0, False)],
+                         kerf=0, max_cuts=2)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 2
+
+    def test_locked_tree_over_limit_rejected(self):
+        with pytest.raises(LockedLayoutError) as exc:
+            _locked([("A", 40, 40, 1)], [("A", 0, 0, False)],
+                    kerf=0, max_cuts=1)
+        message = str(exc.value)
+        assert "max_cuts_per_sheet" in message and "2" in message and "1" in message
+
+    def test_locked_grid_over_limit_rejected(self):
+        # 2x2 locked grid kerf 10 needs 3 cuts; cap 2 must fail even though
+        # the layout itself is perfectly guillotine-separable.
+        pinned = [("A", 0, 0, False), ("A", 50, 0, False),
+                  ("A", 0, 50, False), ("A", 50, 50, False)]
+        with pytest.raises(LockedLayoutError):
+            _locked([("A", 40, 40, 4)], pinned, kerf=10, max_cuts=2)
+
+    def test_locked_offcuts_usable_only_within_budget(self):
+        # Locked one piece (2 cuts); cap 2 leaves no cut budget, so the
+        # remaining same-sized piece must open a new sheet.
+        result = _locked([("A", 40, 40, 2)], [("A", 0, 0, False)],
+                         kerf=0, max_cuts=2)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+        assert result["sheets"][0]["cut_count"] <= 2
