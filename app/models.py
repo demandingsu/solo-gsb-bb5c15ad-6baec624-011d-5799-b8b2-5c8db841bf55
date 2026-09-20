@@ -45,6 +45,13 @@ class PlanRequest(BaseModel):
     stock: Stock = Field(description="原纸尺寸")
     kerf: float = Field(default=0.0, ge=0.0, le=MAX_KERF,
                         description="切缝宽度，每次切割损耗的材料宽度")
+    max_cuts_per_sheet: Optional[int] = Field(
+        default=None, ge=1,
+        description=(
+            "每张原纸允许的最大刀数（按 cut_tree 中 cut 节点计数），"
+            "缺省表示不限制"
+        ),
+    )
     items: list[Item] = Field(min_length=1, max_length=MAX_ITEM_TYPES,
                               description="成品尺寸及数量")
     locked_placements: list[LockedPlacement] = Field(
@@ -132,6 +139,7 @@ class SheetPlan(BaseModel):
     height: float
     utilization: float = Field(ge=0.0, le=1.0,
                                description="成品面积 / 原纸面积")
+    cut_count: int = Field(ge=0, description="切割树中的 cut 节点（刀）数")
     placements: list[Placement]
     cut_tree: TreeNode = Field(description="与 placements 坐标一致的二叉切割树")
 

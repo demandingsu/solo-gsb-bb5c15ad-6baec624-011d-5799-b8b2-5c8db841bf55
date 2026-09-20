@@ -1,7 +1,16 @@
 import pytest
 
-from app.packer import LockedLayoutError, UnfitItemError, build_plan
-from tests.check_plan import check_plan, iter_leaves
+from app.packer import (
+    CutLimitError,
+    LockedLayoutError,
+    Node,
+    Piece,
+    Sheet,
+    UnfitItemError,
+    _best_fit,
+    build_plan,
+)
+from tests.check_plan import check_plan, count_cut_nodes, iter_leaves
 
 
 def plan(stock_w, stock_h, kerf, items):
@@ -128,10 +137,11 @@ class TestTreeConsistency:
 # locked placements
 # ---------------------------------------------------------------------------
 
-def _locked(items, pinned, stock_w=100, stock_h=100, kerf=0):
+def _locked(items, pinned, stock_w=100, stock_h=100, kerf=0, max_cuts=None):
     refs = [(iid, x, y, rot, i + 1)
             for i, (iid, x, y, rot) in enumerate(pinned)]
-    return build_plan(stock_w, stock_h, kerf, items, locked=refs)
+    return build_plan(stock_w, stock_h, kerf, items, locked=refs,
+                      max_cuts_per_sheet=max_cuts)
 
 
 class TestLockedPlacements:
@@ -291,3 +301,102 @@ class TestLockedPlacements:
                          stock_w=n * 11, stock_h=n * 11, kerf=1)
         check_plan(result)
         assert result["summary"]["piece_count"] == n * n
+
+
+# ---------------------------------------------------------------------------
+# per-sheet cut limit
+# ---------------------------------------------------------------------------
+
+class TestCutLimit:
+    def test_cut_count_reported_without_limit(self):
+        result = plan(100, 100, 5, [("A", 45, 100, 2)])
+        assert result["sheets"][0]["cut_count"] == 1
+
+    def test_exact_fit_reports_zero_cuts(self):
+        result = plan(100, 100, 3, [("A", 100, 100, 1)])
+        assert result["sheets"][0]["cut_count"] == 0
+
+    def test_cut_count_matches_cut_tree(self):
+        result = plan(900, 600, 3,
+                      [("flyer", 210, 148, 8), ("card", 90, 55, 20)])
+        check_plan(result)
+        for sheet in result["sheets"]:
+            assert sheet["cut_count"] == count_cut_nodes(sheet["cut_tree"])
+
+    def test_limit_splits_across_sheets(self):
+        # A 50x100 piece on a 100-wide sheet costs one cut; the second
+        # fills the offcut exactly (no cut).  With a limit of 1 only two
+        # pieces share a sheet.
+        result = build_plan(100, 100, 0, [("A", 50, 100, 4)],
+                            max_cuts_per_sheet=1)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+        assert all(s["cut_count"] <= 1 for s in result["sheets"])
+
+    def test_item_too_demanding_for_limit_rejected(self):
+        # A 40x40 piece on a blank 100x100 sheet (kerf 3) needs two cuts.
+        with pytest.raises(CutLimitError) as excinfo:
+            build_plan(100, 100, 3, [("A", 40, 40, 1)], max_cuts_per_sheet=1)
+        assert "A" in str(excinfo.value)
+
+    def test_item_at_exact_limit_accepted(self):
+        result = build_plan(100, 100, 3, [("A", 40, 40, 1)],
+                            max_cuts_per_sheet=2)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 2
+
+    def test_locked_tree_over_limit_rejected(self):
+        # The locked pair needs three cuts (one split + one per piece).
+        pinned = [("A", 0, 0, False), ("A", 50, 0, False)]
+        with pytest.raises(CutLimitError):
+            _locked([("A", 45, 40, 2)], pinned, kerf=5, max_cuts=2)
+
+    def test_locked_tree_at_limit_accepted(self):
+        pinned = [("A", 0, 0, False), ("A", 50, 0, False)]
+        result = _locked([("A", 45, 40, 2)], pinned, kerf=5, max_cuts=3)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 3
+
+    def test_locked_cuts_consume_sheet_budget(self):
+        # The locked tree uses all 3 cuts, so the remaining piece cannot
+        # split any offcut of the first sheet and overflows to a new one.
+        pinned = [("A", 0, 0, False), ("A", 50, 0, False)]
+        result = _locked([("A", 45, 40, 3)], pinned, kerf=5, max_cuts=3)
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+        assert result["sheets"][0]["cut_count"] == 3
+        assert result["sheets"][1]["cut_count"] == 2
+
+
+def _sheet_with_free(rects, kerf, cuts=0):
+    sheet = Sheet(width=100.0, height=100.0, kerf=kerf,
+                  root=Node(kind="free", x=0.0, y=0.0,
+                            width=100.0, height=100.0))
+    sheet.free = [Node(kind="free", x=0.0, y=float(10 * i),
+                       width=w, height=h)
+                  for i, (w, h) in enumerate(rects)]
+    sheet.cuts = cuts
+    return sheet
+
+
+class TestBestFitCutLimit:
+    def test_equal_fit_prefers_fewer_added_cuts(self):
+        # Both rectangles score the same for a 20x10 piece (short side 0,
+        # leftover area 60) but the split costs 1 cut vs 0.
+        sheet = _sheet_with_free([(26, 10), (20, 13)], kerf=3)
+        found = _best_fit([sheet], Piece("A", 20, 10), max_cuts=10)
+        assert found is not None
+        assert found[1] == 1
+
+    def test_equal_fit_without_limit_keeps_legacy_order(self):
+        sheet = _sheet_with_free([(26, 10), (20, 13)], kerf=3)
+        found = _best_fit([sheet], Piece("A", 20, 10))
+        assert found is not None
+        assert found[1] == 0
+
+    def test_rects_exceeding_the_limit_are_skipped(self):
+        # The split adds one cut; the sheet is already at the limit.
+        sheet = _sheet_with_free([(26, 10)], kerf=3, cuts=1)
+        piece = Piece("A", 20, 10)
+        assert _best_fit([sheet], piece, max_cuts=1) is None
+        assert _best_fit([sheet], piece, max_cuts=2) is not None

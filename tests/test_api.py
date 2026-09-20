@@ -253,3 +253,88 @@ def test_locked_negative_coordinates_rejected():
         "locked_placements": [{"item": "A", "x": -1, "y": 0}],
     }
     assert client.post("/plans", json=payload).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# max_cuts_per_sheet
+# ---------------------------------------------------------------------------
+
+def test_max_cuts_per_sheet_limits_cuts():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 0,
+        "items": [{"id": "A", "width": 50, "height": 100, "quantity": 4}],
+        "max_cuts_per_sheet": 1,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    assert body["summary"]["sheet_count"] == 2
+    assert all(s["cut_count"] <= 1 for s in body["sheets"])
+
+
+def test_max_cuts_per_sheet_rejects_uncuttable_item():
+    # A 40x40 piece on a blank 100x100 sheet (kerf 3) needs two cuts.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "max_cuts_per_sheet": 1,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "max_cuts_per_sheet" in response.json()["detail"]
+
+
+def test_max_cuts_per_sheet_counts_locked_tree():
+    # The locked pair needs three cuts on the first sheet.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 5,
+        "items": [{"id": "A", "width": 45, "height": 40, "quantity": 2}],
+        "locked_placements": [
+            {"item": "A", "x": 0, "y": 0},
+            {"item": "A", "x": 50, "y": 0},
+        ],
+        "max_cuts_per_sheet": 2,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "max_cuts_per_sheet" in response.json()["detail"]
+
+
+def test_max_cuts_per_sheet_locked_within_limit():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 5,
+        "items": [{"id": "A", "width": 45, "height": 40, "quantity": 2}],
+        "locked_placements": [
+            {"item": "A", "x": 0, "y": 0},
+            {"item": "A", "x": 50, "y": 0},
+        ],
+        "max_cuts_per_sheet": 3,
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    assert body["sheets"][0]["cut_count"] == 3
+
+
+def test_max_cuts_per_sheet_validation():
+    base = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"width": 10, "height": 10, "quantity": 1}],
+    }
+    for bad in (0, -1, 1.5, "two"):
+        payload = {**base, "max_cuts_per_sheet": bad}
+        assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_cut_count_returned_per_sheet():
+    response = client.post("/plans", json=VALID_PAYLOAD)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)  # check_plan asserts cut_count matches the cut tree
+    assert all("cut_count" in s for s in body["sheets"])

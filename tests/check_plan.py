@@ -12,6 +12,13 @@ def iter_leaves(node: dict):
         yield from iter_leaves(node["children"][1])
 
 
+def count_cut_nodes(node: dict) -> int:
+    """Number of cut nodes in the subtree (one guillotine cut each)."""
+    if node["type"] != "cut":
+        return 0
+    return 1 + sum(count_cut_nodes(child) for child in node["children"])
+
+
 def check_cut_tree(node: dict, kerf: float) -> None:
     """Recursively verify the binary guillotine cut tree.
 
@@ -62,6 +69,9 @@ def check_sheet(sheet: dict, kerf: float) -> None:
     placements = sheet["placements"]
 
     check_cut_tree(sheet["cut_tree"], kerf)
+
+    # The reported cut count must match the actual cut tree.
+    assert sheet["cut_count"] == count_cut_nodes(sheet["cut_tree"])
 
     # Tree item leaves must be exactly the placements list.
     tree_items = [
